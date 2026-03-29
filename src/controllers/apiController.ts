@@ -6,16 +6,25 @@ import { AuthRequest } from '../middleware/auth';
 // --- DASHBOARD SCHEMATICS ---
 export const getDashboardStats = async (req: AuthRequest, res: Response) => {
   try {
-    // 1. Get all invoices to calculate stats
-    const invoices = await prisma.invoice.findMany(); // Note: In a real multi-tenant app, filter by userId
-    
+    // Only fields needed for stats (typed explicitly via select)
+    const invoices = await prisma.invoice.findMany({
+      select: {
+        status: true,
+        totalAmount: true,
+        amountPaid: true,
+      },
+    });
+
     const totalRevenue = invoices
-      .filter(inv => inv.status === 'PAID')
-      .reduce((sum, inv) => sum + inv.totalAmount, 0);
-      
+      .filter((inv) => inv.status === 'PAID' || inv.status === 'OVERPAID')
+      .reduce((sum, inv) => sum + inv.amountPaid, 0);
+
     const outstanding = invoices
-      .filter(inv => inv.status === 'PENDING')
-      .reduce((sum, inv) => sum + inv.totalAmount, 0);
+      .filter((inv) => inv.status !== 'DRAFT')
+      .reduce((sum, inv) => {
+        const bal = inv.totalAmount - inv.amountPaid;
+        return sum + (bal > 0 ? bal : 0);
+      }, 0);
 
     const clientCount = await prisma.client.count();
 
@@ -113,6 +122,7 @@ export const createInvoice = async (req: AuthRequest, res: Response) => {
         dueDate: new Date(dueDate),
         status: invStatus,
         totalAmount,
+        amountPaid: 0,
         items: {
           create: normalized,
         },
@@ -124,6 +134,112 @@ export const createInvoice = async (req: AuthRequest, res: Response) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: 'Error creating invoice' });
+  }
+};
+
+export const getInvoiceById = async (req: AuthRequest, res: Response) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      return res.status(400).json({ message: 'Invalid invoice id' });
+    }
+    const invoice = await prisma.invoice.findUnique({
+      where: { id },
+      include: { client: true, items: true },
+    });
+    if (!invoice) {
+      return res.status(404).json({ message: 'Invoice not found' });
+    }
+    res.json(invoice);
+  } catch (error) {
+    res.status(500).json({ message: 'Error fetching invoice' });
+  }
+};
+
+function roundMoney(n: number) {
+  return Math.round(n * 100) / 100;
+}
+
+/** Apply payment rules and persist status from amountPaid vs totalAmount */
+export const patchInvoice = async (req: AuthRequest, res: Response) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      return res.status(400).json({ message: 'Invalid invoice id' });
+    }
+
+    const inv = await prisma.invoice.findUnique({ where: { id } });
+    if (!inv) {
+      return res.status(404).json({ message: 'Invoice not found' });
+    }
+
+    const { op } = req.body as { op?: string; amount?: number; excessAmount?: number };
+
+    if (op === 'mark_fully_paid') {
+      const updated = await prisma.invoice.update({
+        where: { id },
+        data: {
+          amountPaid: inv.totalAmount,
+          status: 'PAID',
+        },
+        include: { client: true, items: true },
+      });
+      return res.json(updated);
+    }
+
+    if (op === 'add_payment') {
+      const amount = Number(req.body.amount);
+      if (!(amount > 0)) {
+        return res.status(400).json({ message: 'Positive amount required' });
+      }
+      const newPaid = roundMoney(inv.amountPaid + amount);
+      let status = inv.status;
+      if (newPaid > inv.totalAmount) {
+        status = 'OVERPAID';
+      } else if (newPaid >= inv.totalAmount) {
+        status = 'PAID';
+      } else if (newPaid > 0) {
+        status = 'PARTIAL';
+      }
+      const updated = await prisma.invoice.update({
+        where: { id },
+        data: { amountPaid: newPaid, status },
+        include: { client: true, items: true },
+      });
+      return res.json(updated);
+    }
+
+    if (op === 'record_overpayment') {
+      let newPaid: number;
+      if (req.body.totalReceived != null && req.body.totalReceived !== '') {
+        const tr = Number(req.body.totalReceived);
+        if (!(tr > inv.totalAmount)) {
+          return res.status(400).json({
+            message: 'totalReceived must be greater than invoice total to record overpayment.',
+          });
+        }
+        newPaid = roundMoney(tr);
+      } else {
+        const excess = Number(req.body.excessAmount);
+        if (!(excess > 0)) {
+          return res.status(400).json({
+            message: 'Provide totalReceived or a positive excessAmount (credit beyond invoice total).',
+          });
+        }
+        newPaid = roundMoney(inv.totalAmount + excess);
+      }
+      const updated = await prisma.invoice.update({
+        where: { id },
+        data: { amountPaid: newPaid, status: 'OVERPAID' },
+        include: { client: true, items: true },
+      });
+      return res.json(updated);
+    }
+
+    return res.status(400).json({ message: 'Unknown op. Use mark_fully_paid, add_payment, or record_overpayment.' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Error updating invoice' });
   }
 };
 

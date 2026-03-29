@@ -5,7 +5,9 @@ import {
   getClients,
   createClient,
   getInvoices,
+  getInvoiceById,
   createInvoice,
+  patchInvoice,
   deleteInvoice,
   deleteClient,
 } from '../controllers/apiController';
@@ -22,7 +24,9 @@ router.post('/clients', createClient);
 router.delete('/clients/:id', deleteClient);
 
 router.get('/invoices', getInvoices);
+router.get('/invoices/:id', getInvoiceById);
 router.post('/invoices', createInvoice);
+router.patch('/invoices/:id', patchInvoice);
 router.delete('/invoices/:id', deleteInvoice);
 
 export default router;
