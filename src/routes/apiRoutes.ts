@@ -2,6 +2,7 @@
 import { Router } from 'express';
 import {
   getDashboardStats,
+  getRecordsHistory,
   getClients,
   createClient,
   getInvoices,
@@ -19,6 +20,7 @@ const router = Router();
 router.use(requireAuth);
 
 router.get('/dashboard', getDashboardStats);
+router.get('/records', getRecordsHistory);
 router.get('/clients', getClients);
 router.post('/clients', createClient);
 router.delete('/clients/:id', deleteClient);

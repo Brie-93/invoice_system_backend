@@ -3,15 +3,27 @@ import { Response } from 'express';
 import prisma from '../utils/prisma';
 import { AuthRequest } from '../middleware/auth';
 
+function buildLast12MonthBuckets() {
+  const buckets: { key: string; name: string; revenue: number; billed: number }[] = [];
+  const now = new Date();
+  for (let i = 11; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    const name = d.toLocaleString('en-KE', { month: 'short', year: '2-digit' });
+    buckets.push({ key, name, revenue: 0, billed: 0 });
+  }
+  return buckets;
+}
+
 // --- DASHBOARD SCHEMATICS ---
 export const getDashboardStats = async (req: AuthRequest, res: Response) => {
   try {
-    // Only fields needed for stats (typed explicitly via select)
     const invoices = await prisma.invoice.findMany({
       select: {
         status: true,
         totalAmount: true,
         amountPaid: true,
+        issueDate: true,
       },
     });
 
@@ -28,19 +40,54 @@ export const getDashboardStats = async (req: AuthRequest, res: Response) => {
 
     const clientCount = await prisma.client.count();
 
-    // Mock chart data for the beautiful area chart
-    const chartData =[
-      { name: 'Jan', revenue: 4000, expected: 2400 },
-      { name: 'Feb', revenue: 3000, expected: 1398 },
-      { name: 'Mar', revenue: 2000, expected: 9800 },
-      { name: 'Apr', revenue: 2780, expected: 3908 },
-      { name: 'May', revenue: 1890, expected: 4800 },
-      { name: 'Jun', revenue: totalRevenue > 0 ? totalRevenue : 2390, expected: 3800 },
-    ];
+    const chartBuckets = buildLast12MonthBuckets();
+    const byKey = new Map(chartBuckets.map((b) => [b.key, b]));
+
+    for (const inv of invoices) {
+      const d = new Date(inv.issueDate);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+      const bucket = byKey.get(key);
+      if (!bucket) continue;
+      bucket.billed += inv.totalAmount;
+      if (inv.status === 'PAID' || inv.status === 'OVERPAID') {
+        bucket.revenue += inv.amountPaid;
+      }
+    }
+
+    const chartData = chartBuckets.map(({ name, revenue, billed }) => ({
+      name,
+      revenue: Math.round(revenue * 100) / 100,
+      billed: Math.round(billed * 100) / 100,
+    }));
 
     res.json({ totalRevenue, outstanding, clientCount, chartData });
   } catch (error) {
     res.status(500).json({ message: 'Error fetching stats' });
+  }
+};
+
+/** Full snapshot: app users (no secrets) + every client with all invoices & line items */
+export const getRecordsHistory = async (req: AuthRequest, res: Response) => {
+  try {
+    const [users, clients] = await Promise.all([
+      prisma.user.findMany({
+        select: { id: true, email: true, name: true, createdAt: true },
+        orderBy: { createdAt: 'desc' },
+      }),
+      prisma.client.findMany({
+        include: {
+          invoices: {
+            orderBy: { issueDate: 'desc' },
+            include: { items: true },
+          },
+        },
+        orderBy: { name: 'asc' },
+      }),
+    ]);
+    res.json({ users, clients, generatedAt: new Date().toISOString() });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Error fetching records history' });
   }
 };
 
