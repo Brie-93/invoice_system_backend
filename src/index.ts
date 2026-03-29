@@ -3,6 +3,8 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import authRoutes from './routes/authRoutes';
+import apiRoutes from './routes/apiRoutes';
+
 
 dotenv.config();
 
@@ -14,7 +16,9 @@ app.use(cors()); // Allows frontend to talk to backend
 app.use(express.json()); // Allows backend to understand JSON
 
 // Routes
-app.use('/api', authRoutes);
+app.use('/api/auth', authRoutes); 
+app.use('/api/app', apiRoutes);
+
 
 app.get('/', (req, res) => {
   res.send('Interior Design API is running...');
