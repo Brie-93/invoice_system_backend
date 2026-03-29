@@ -4,7 +4,7 @@ import prisma from '../utils/prisma';
 import { AuthRequest } from '../middleware/auth';
 
 function buildLast12MonthBuckets() {
-  const buckets: { key: string; name: string; revenue: number; billed: number }[] = [];
+  const buckets: { key: string; name: string; revenue: number; billed: number }[] =[];
   const now = new Date();
   for (let i = 11; i >= 0; i--) {
     const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
@@ -18,27 +18,34 @@ function buildLast12MonthBuckets() {
 // --- DASHBOARD SCHEMATICS ---
 export const getDashboardStats = async (req: AuthRequest, res: Response) => {
   try {
+    // Fetch ALL invoices (even deleted ones) to preserve historical data
     const invoices = await prisma.invoice.findMany({
       select: {
         status: true,
         totalAmount: true,
         amountPaid: true,
         issueDate: true,
+        deletedAt: true, // Needed to filter out outstanding
       },
     });
 
+    // Total Revenue: Include ALL paid invoices (even if the client was deleted later)
     const totalRevenue = invoices
       .filter((inv) => inv.status === 'PAID' || inv.status === 'OVERPAID')
       .reduce((sum, inv) => sum + inv.amountPaid, 0);
 
+    // Outstanding: Only count active (NOT deleted) invoices that are pending
     const outstanding = invoices
-      .filter((inv) => inv.status !== 'DRAFT')
+      .filter((inv) => inv.status !== 'DRAFT' && inv.deletedAt === null)
       .reduce((sum, inv) => {
         const bal = inv.totalAmount - inv.amountPaid;
         return sum + (bal > 0 ? bal : 0);
       }, 0);
 
-    const clientCount = await prisma.client.count();
+    // Active Clients count
+    const clientCount = await prisma.client.count({
+      where: { deletedAt: null }
+    });
 
     const chartBuckets = buildLast12MonthBuckets();
     const byKey = new Map(chartBuckets.map((b) => [b.key, b]));
@@ -48,6 +55,7 @@ export const getDashboardStats = async (req: AuthRequest, res: Response) => {
       const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
       const bucket = byKey.get(key);
       if (!bucket) continue;
+      
       bucket.billed += inv.totalAmount;
       if (inv.status === 'PAID' || inv.status === 'OVERPAID') {
         bucket.revenue += inv.amountPaid;
@@ -66,7 +74,7 @@ export const getDashboardStats = async (req: AuthRequest, res: Response) => {
   }
 };
 
-/** Full snapshot: app users (no secrets) + every client with all invoices & line items */
+/** Full snapshot: EVERY client and EVERY invoice, including deleted ones (Soft Deletes) */
 export const getRecordsHistory = async (req: AuthRequest, res: Response) => {
   try {
     const [users, clients] = await Promise.all([
@@ -75,6 +83,7 @@ export const getRecordsHistory = async (req: AuthRequest, res: Response) => {
         orderBy: { createdAt: 'desc' },
       }),
       prisma.client.findMany({
+        // NO where clause -> Fetches deleted and active!
         include: {
           invoices: {
             orderBy: { issueDate: 'desc' },
@@ -95,7 +104,14 @@ export const getRecordsHistory = async (req: AuthRequest, res: Response) => {
 export const getClients = async (req: AuthRequest, res: Response) => {
   try {
     const clients = await prisma.client.findMany({
-      include: { _count: { select: { invoices: true } } }
+      where: { deletedAt: null }, // Only fetch ACTIVE clients
+      include: { 
+        _count: { 
+          select: { 
+            invoices: { where: { deletedAt: null } } // Only count ACTIVE invoices
+          } 
+        } 
+      }
     });
     res.json(clients);
   } catch (error) {
@@ -119,6 +135,7 @@ export const createClient = async (req: AuthRequest, res: Response) => {
 export const getInvoices = async (req: AuthRequest, res: Response) => {
   try {
     const invoices = await prisma.invoice.findMany({
+      where: { deletedAt: null }, // Only fetch ACTIVE invoices
       orderBy: { issueDate: 'desc' },
       include: { client: true, items: true },
     });
@@ -137,8 +154,8 @@ export const createInvoice = async (req: AuthRequest, res: Response) => {
       issueDate?: string;
       dueDate?: string;
       status?: string;
-      items?: CreateItemBody[];
-    };
+      items?: CreateItemBody
+};
 
     if (
       clientId == null ||
@@ -194,7 +211,9 @@ export const getInvoiceById = async (req: AuthRequest, res: Response) => {
       where: { id },
       include: { client: true, items: true },
     });
-    if (!invoice) {
+    
+    // Safety check: Prevent fetching if it was soft-deleted
+    if (!invoice || invoice.deletedAt !== null) {
       return res.status(404).json({ message: 'Invoice not found' });
     }
     res.json(invoice);
@@ -207,7 +226,6 @@ function roundMoney(n: number) {
   return Math.round(n * 100) / 100;
 }
 
-/** Apply payment rules and persist status from amountPaid vs totalAmount */
 export const patchInvoice = async (req: AuthRequest, res: Response) => {
   try {
     const id = Number(req.params.id);
@@ -216,7 +234,7 @@ export const patchInvoice = async (req: AuthRequest, res: Response) => {
     }
 
     const inv = await prisma.invoice.findUnique({ where: { id } });
-    if (!inv) {
+    if (!inv || inv.deletedAt !== null) {
       return res.status(404).json({ message: 'Invoice not found' });
     }
 
@@ -290,16 +308,23 @@ export const patchInvoice = async (req: AuthRequest, res: Response) => {
   }
 };
 
+// ==========================================
+// --- SOFT DELETION LOGIC ---
+// ==========================================
+
 export const deleteInvoice = async (req: AuthRequest, res: Response) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) {
       return res.status(400).json({ message: 'Invalid invoice id' });
     }
-    await prisma.$transaction([
-      prisma.invoiceItem.deleteMany({ where: { invoiceId: id } }),
-      prisma.invoice.delete({ where: { id } }),
-    ]);
+    
+    // SOFT DELETE: Instead of deleting from DB, we just update the timestamp
+    await prisma.invoice.update({
+      where: { id },
+      data: { deletedAt: new Date() }
+    });
+    
     res.json({ ok: true });
   } catch (error) {
     res.status(500).json({ message: 'Error deleting invoice' });
@@ -314,24 +339,23 @@ export const deleteClient = async (req: AuthRequest, res: Response) => {
     }
 
     const existing = await prisma.client.findUnique({ where: { id } });
-    if (!existing) {
+    if (!existing || existing.deletedAt !== null) {
       return res.status(404).json({ message: 'Client not found' });
     }
 
-    const invoiceRows = await prisma.invoice.findMany({
-      where: { clientId: id },
-      select: { id: true },
-    });
-    const invoiceIds = invoiceRows.map((r) => r.id);
-
+    // SOFT DELETE: Update the client AND all of their active invoices
     await prisma.$transaction(async (tx) => {
-      if (invoiceIds.length > 0) {
-        await tx.invoiceItem.deleteMany({
-          where: { invoiceId: { in: invoiceIds } },
-        });
-      }
-      await tx.invoice.deleteMany({ where: { clientId: id } });
-      await tx.client.delete({ where: { id } });
+      // 1. Soft delete all active invoices belonging to this client
+      await tx.invoice.updateMany({
+        where: { clientId: id, deletedAt: null },
+        data: { deletedAt: new Date() }
+      });
+      
+      // 2. Soft delete the client
+      await tx.client.update({
+        where: { id },
+        data: { deletedAt: new Date() }
+      });
     });
 
     res.json({ ok: true });

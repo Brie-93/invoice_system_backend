@@ -21,6 +21,7 @@ model Client {
   email     String   @unique
   address   String?
   invoices  Invoice[]
+  deletedAt DateTime?
 }
 
 model Invoice {
@@ -34,6 +35,7 @@ model Invoice {
   items       InvoiceItem[]
   totalAmount Float
   amountPaid  Float         @default(0)
+  deletedAt   DateTime?
 }
 
 model InvoiceItem {
