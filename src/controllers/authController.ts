@@ -70,9 +70,10 @@ export const login = async (req: Request, res: Response): Promise<void> => {
 export const changePassword = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { oldPassword, newPassword } = req.body;
-    const userId = Number(req.user?.userId);
-    if (!userId || Number.isNaN(userId)) {
-      res.status(401).json({ message: 'Unauthorized' });
+    const userId = req.user?.userId;
+
+    if (!userId) {
+      res.status(401).json({ message: 'Unauthorized. Please log in again.' });
       return;
     }
     const user = await prisma.user.findUnique({ where: { id: userId } });

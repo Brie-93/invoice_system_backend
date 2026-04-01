@@ -227,11 +227,6 @@ function roundMoney(n: number) {
 }
 
 export const patchInvoice = async (req: AuthRequest, res: Response) => {
-  console.log('=== PATCH INVOICE ===');
-  console.log('Content-Type:', req.headers['content-type']);
-  console.log('Body:', JSON.stringify(req.body));
-  console.log('op:', req.body?.op);
-  console.log('inv id:', req.params.id);
   try {
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) {
@@ -243,9 +238,12 @@ export const patchInvoice = async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ message: 'Invoice not found' });
     }
 
-    const { op } = req.body as { op?: string; amount?: number; excessAmount?: number; [key: string]: any };
+    // Safely extract 'op' from the body
+    const op = req.body?.op;
 
-
+    // ==========================================
+    // --- 1. DRAFT EDITING LOGIC ---
+    // ==========================================
     if (op === 'update_draft') {
       if (inv.status !== 'DRAFT') {
         return res.status(400).json({ message: 'Only drafts can be completely edited.' });
@@ -265,7 +263,9 @@ export const patchInvoice = async (req: AuthRequest, res: Response) => {
 
       const subtotal = normalized.reduce((sum: number, it: any) => sum + it.quantity * it.rate, 0);
       const totalAmount = Math.round(subtotal * 1.1 * 100) / 100;
-      const invStatus = status === 'DRAFT' ? 'DRAFT' : 'PENDING';
+      
+      // If the user clicked "Send Invoice", upgrade status to PENDING
+      const invStatus = status === 'PENDING' ? 'PENDING' : 'DRAFT';
 
       // Update the invoice, delete old items, create new items
       const updated = await prisma.invoice.update({
@@ -277,8 +277,8 @@ export const patchInvoice = async (req: AuthRequest, res: Response) => {
           status: invStatus,
           totalAmount,
           items: {
-            deleteMany: {}, // Deletes the old line items
-            create: normalized, // Adds the newly edited line items
+            deleteMany: {}, // Wipe old items
+            create: normalized, // Save new items
           }
         },
         include: { client: true, items: true }
@@ -287,6 +287,9 @@ export const patchInvoice = async (req: AuthRequest, res: Response) => {
       return res.json(updated);
     }
 
+    // ==========================================
+    // --- 2. PAYMENT LOGIC ---
+    // ==========================================
     if (inv.status === 'DRAFT' && op !== 'publish') {
       return res.status(400).json({ 
         message: 'Cannot add payments to a Draft. Please finalize/send the invoice first.' 
@@ -296,10 +299,7 @@ export const patchInvoice = async (req: AuthRequest, res: Response) => {
     if (op === 'mark_fully_paid') {
       const updated = await prisma.invoice.update({
         where: { id },
-        data: {
-          amountPaid: inv.totalAmount,
-          status: 'PAID',
-        },
+        data: { amountPaid: inv.totalAmount, status: 'PAID' },
         include: { client: true, items: true },
       });
       return res.json(updated);
@@ -311,17 +311,17 @@ export const patchInvoice = async (req: AuthRequest, res: Response) => {
         return res.status(400).json({ message: 'Positive amount required' });
       }
       const newPaid = roundMoney(inv.amountPaid + amount);
-      let status = inv.status;
+      let newStatus = inv.status;
       if (newPaid > inv.totalAmount) {
-        status = 'OVERPAID';
+        newStatus = 'OVERPAID';
       } else if (newPaid >= inv.totalAmount) {
-        status = 'PAID';
+        newStatus = 'PAID';
       } else if (newPaid > 0) {
-        status = 'PARTIAL';
+        newStatus = 'PARTIAL';
       }
       const updated = await prisma.invoice.update({
         where: { id },
-        data: { amountPaid: newPaid, status },
+        data: { amountPaid: newPaid, status: newStatus },
         include: { client: true, items: true },
       });
       return res.json(updated);
@@ -332,17 +332,13 @@ export const patchInvoice = async (req: AuthRequest, res: Response) => {
       if (req.body.totalReceived != null && req.body.totalReceived !== '') {
         const tr = Number(req.body.totalReceived);
         if (!(tr > inv.totalAmount)) {
-          return res.status(400).json({
-            message: 'totalReceived must be greater than invoice total to record overpayment.',
-          });
+          return res.status(400).json({ message: 'totalReceived must be greater than invoice total.' });
         }
         newPaid = roundMoney(tr);
       } else {
         const excess = Number(req.body.excessAmount);
         if (!(excess > 0)) {
-          return res.status(400).json({
-            message: 'Provide totalReceived or a positive excessAmount (credit beyond invoice total).',
-          });
+          return res.status(400).json({ message: 'Provide totalReceived or a positive excessAmount.' });
         }
         newPaid = roundMoney(inv.totalAmount + excess);
       }
@@ -354,7 +350,7 @@ export const patchInvoice = async (req: AuthRequest, res: Response) => {
       return res.json(updated);
     }
 
-    return res.status(400).json({ message: 'Unknown op. Use mark_fully_paid, add_payment, or record_overpayment.' });
+    return res.status(400).json({ message: `Unknown op: ${op}. Use update_draft, mark_fully_paid, add_payment, or record_overpayment.` });
   } catch (error) {
     console.error('patchInvoice error:', error);
     res.status(500).json({ message: 'Error updating invoice' });

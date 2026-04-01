@@ -1,0 +1,383 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.deleteClient = exports.deleteInvoice = exports.patchInvoice = exports.getInvoiceById = exports.createInvoice = exports.getInvoices = exports.createClient = exports.getClients = exports.getRecordsHistory = exports.getDashboardStats = void 0;
+const prisma_1 = __importDefault(require("../utils/prisma"));
+function buildLast12MonthBuckets() {
+    const buckets = [];
+    const now = new Date();
+    for (let i = 11; i >= 0; i--) {
+        const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+        const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+        const name = d.toLocaleString('en-KE', { month: 'short', year: '2-digit' });
+        buckets.push({ key, name, revenue: 0, billed: 0 });
+    }
+    return buckets;
+}
+// --- DASHBOARD SCHEMATICS ---
+const getDashboardStats = async (req, res) => {
+    try {
+        // Fetch ALL invoices (even deleted ones) to preserve historical data
+        const invoices = await prisma_1.default.invoice.findMany({
+            select: {
+                status: true,
+                totalAmount: true,
+                amountPaid: true,
+                issueDate: true,
+                deletedAt: true, // Needed to filter out outstanding
+            },
+        });
+        // Total Revenue: Include ALL paid invoices (even if the client was deleted later)
+        const totalRevenue = invoices
+            .filter((inv) => inv.status === 'PAID' || inv.status === 'OVERPAID')
+            .reduce((sum, inv) => sum + inv.amountPaid, 0);
+        // Outstanding: Only count active (NOT deleted) invoices that are pending
+        const outstanding = invoices
+            .filter((inv) => inv.status !== 'DRAFT' && inv.deletedAt === null)
+            .reduce((sum, inv) => {
+            const bal = inv.totalAmount - inv.amountPaid;
+            return sum + (bal > 0 ? bal : 0);
+        }, 0);
+        // Active Clients count
+        const clientCount = await prisma_1.default.client.count({
+            where: { deletedAt: null }
+        });
+        const chartBuckets = buildLast12MonthBuckets();
+        const byKey = new Map(chartBuckets.map((b) => [b.key, b]));
+        for (const inv of invoices) {
+            const d = new Date(inv.issueDate);
+            const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+            const bucket = byKey.get(key);
+            if (!bucket)
+                continue;
+            bucket.billed += inv.totalAmount;
+            if (inv.status === 'PAID' || inv.status === 'OVERPAID') {
+                bucket.revenue += inv.amountPaid;
+            }
+        }
+        const chartData = chartBuckets.map(({ name, revenue, billed }) => ({
+            name,
+            revenue: Math.round(revenue * 100) / 100,
+            billed: Math.round(billed * 100) / 100,
+        }));
+        res.json({ totalRevenue, outstanding, clientCount, chartData });
+    }
+    catch (error) {
+        res.status(500).json({ message: 'Error fetching stats' });
+    }
+};
+exports.getDashboardStats = getDashboardStats;
+/** Full snapshot: EVERY client and EVERY invoice, including deleted ones (Soft Deletes) */
+const getRecordsHistory = async (req, res) => {
+    try {
+        const [users, clients] = await Promise.all([
+            prisma_1.default.user.findMany({
+                select: { id: true, email: true, name: true, createdAt: true },
+                orderBy: { createdAt: 'desc' },
+            }),
+            prisma_1.default.client.findMany({
+                // NO where clause -> Fetches deleted and active!
+                include: {
+                    invoices: {
+                        orderBy: { issueDate: 'desc' },
+                        include: { items: true },
+                    },
+                },
+                orderBy: { name: 'asc' },
+            }),
+        ]);
+        res.json({ users, clients, generatedAt: new Date().toISOString() });
+    }
+    catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Error fetching records history' });
+    }
+};
+exports.getRecordsHistory = getRecordsHistory;
+// --- CLIENTS ---
+const getClients = async (req, res) => {
+    try {
+        const clients = await prisma_1.default.client.findMany({
+            where: { deletedAt: null }, // Only fetch ACTIVE clients
+            include: {
+                _count: {
+                    select: {
+                        invoices: { where: { deletedAt: null } } // Only count ACTIVE invoices
+                    }
+                }
+            }
+        });
+        res.json(clients);
+    }
+    catch (error) {
+        res.status(500).json({ message: 'Error fetching clients' });
+    }
+};
+exports.getClients = getClients;
+const createClient = async (req, res) => {
+    try {
+        const { name, email, address } = req.body;
+        const client = await prisma_1.default.client.create({
+            data: { name, email, address }
+        });
+        res.status(201).json(client);
+    }
+    catch (error) {
+        res.status(500).json({ message: 'Error creating client' });
+    }
+};
+exports.createClient = createClient;
+// --- INVOICES ---
+const getInvoices = async (req, res) => {
+    try {
+        const invoices = await prisma_1.default.invoice.findMany({
+            where: { deletedAt: null }, // Only fetch ACTIVE invoices
+            orderBy: { issueDate: 'desc' },
+            include: { client: true, items: true },
+        });
+        res.json(invoices);
+    }
+    catch (error) {
+        res.status(500).json({ message: 'Error fetching invoices' });
+    }
+};
+exports.getInvoices = getInvoices;
+const createInvoice = async (req, res) => {
+    try {
+        const { clientId, issueDate, dueDate, status, items } = req.body;
+        if (clientId == null ||
+            !dueDate ||
+            !Array.isArray(items) ||
+            items.length === 0) {
+            return res.status(400).json({ message: 'clientId, dueDate, and items are required' });
+        }
+        const normalized = items.map((it) => ({
+            description: String(it.description ?? '').trim() || 'Line item',
+            quantity: Math.max(1, Math.floor(Number(it.quantity) || 1)),
+            rate: Math.max(0, Number(it.rate) || 0),
+        }));
+        const subtotal = normalized.reduce((sum, it) => sum + it.quantity * it.rate, 0);
+        const totalAmount = Math.round(subtotal * 1.1 * 100) / 100;
+        const invoiceNo = `INV-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const invStatus = status === 'DRAFT' ? 'DRAFT' : 'PENDING';
+        const invoice = await prisma_1.default.invoice.create({
+            data: {
+                invoiceNo,
+                clientId: Number(clientId),
+                issueDate: issueDate ? new Date(issueDate) : new Date(),
+                dueDate: new Date(dueDate),
+                status: invStatus,
+                totalAmount,
+                amountPaid: 0,
+                items: {
+                    create: normalized,
+                },
+            },
+            include: { client: true, items: true },
+        });
+        res.status(201).json(invoice);
+    }
+    catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Error creating invoice' });
+    }
+};
+exports.createInvoice = createInvoice;
+const getInvoiceById = async (req, res) => {
+    try {
+        const id = Number(req.params.id);
+        if (!Number.isFinite(id)) {
+            return res.status(400).json({ message: 'Invalid invoice id' });
+        }
+        const invoice = await prisma_1.default.invoice.findUnique({
+            where: { id },
+            include: { client: true, items: true },
+        });
+        // Safety check: Prevent fetching if it was soft-deleted
+        if (!invoice || invoice.deletedAt !== null) {
+            return res.status(404).json({ message: 'Invoice not found' });
+        }
+        res.json(invoice);
+    }
+    catch (error) {
+        res.status(500).json({ message: 'Error fetching invoice' });
+    }
+};
+exports.getInvoiceById = getInvoiceById;
+function roundMoney(n) {
+    return Math.round(n * 100) / 100;
+}
+const patchInvoice = async (req, res) => {
+    try {
+        const id = Number(req.params.id);
+        if (!Number.isFinite(id)) {
+            return res.status(400).json({ message: 'Invalid invoice id' });
+        }
+        const inv = await prisma_1.default.invoice.findUnique({ where: { id } });
+        if (!inv || inv.deletedAt !== null) {
+            return res.status(404).json({ message: 'Invoice not found' });
+        }
+        // Safely extract 'op' from the body
+        const op = req.body?.op;
+        // ==========================================
+        // --- 1. DRAFT EDITING LOGIC ---
+        // ==========================================
+        if (op === 'update_draft') {
+            if (inv.status !== 'DRAFT') {
+                return res.status(400).json({ message: 'Only drafts can be completely edited.' });
+            }
+            const { clientId, issueDate, dueDate, status, items } = req.body;
+            if (!clientId || !dueDate || !Array.isArray(items) || items.length === 0) {
+                return res.status(400).json({ message: 'Missing required fields for update.' });
+            }
+            const normalized = items.map((it) => ({
+                description: String(it.description ?? '').trim() || 'Line item',
+                quantity: Math.max(1, Math.floor(Number(it.quantity) || 1)),
+                rate: Math.max(0, Number(it.rate) || 0),
+            }));
+            const subtotal = normalized.reduce((sum, it) => sum + it.quantity * it.rate, 0);
+            const totalAmount = Math.round(subtotal * 1.1 * 100) / 100;
+            // If the user clicked "Send Invoice", upgrade status to PENDING
+            const invStatus = status === 'PENDING' ? 'PENDING' : 'DRAFT';
+            // Update the invoice, delete old items, create new items
+            const updated = await prisma_1.default.invoice.update({
+                where: { id },
+                data: {
+                    clientId: Number(clientId),
+                    issueDate: issueDate ? new Date(issueDate) : new Date(),
+                    dueDate: new Date(dueDate),
+                    status: invStatus,
+                    totalAmount,
+                    items: {
+                        deleteMany: {}, // Wipe old items
+                        create: normalized, // Save new items
+                    }
+                },
+                include: { client: true, items: true }
+            });
+            return res.json(updated);
+        }
+        // ==========================================
+        // --- 2. PAYMENT LOGIC ---
+        // ==========================================
+        if (inv.status === 'DRAFT' && op !== 'publish') {
+            return res.status(400).json({
+                message: 'Cannot add payments to a Draft. Please finalize/send the invoice first.'
+            });
+        }
+        if (op === 'mark_fully_paid') {
+            const updated = await prisma_1.default.invoice.update({
+                where: { id },
+                data: { amountPaid: inv.totalAmount, status: 'PAID' },
+                include: { client: true, items: true },
+            });
+            return res.json(updated);
+        }
+        if (op === 'add_payment') {
+            const amount = Number(req.body.amount);
+            if (!(amount > 0)) {
+                return res.status(400).json({ message: 'Positive amount required' });
+            }
+            const newPaid = roundMoney(inv.amountPaid + amount);
+            let newStatus = inv.status;
+            if (newPaid > inv.totalAmount) {
+                newStatus = 'OVERPAID';
+            }
+            else if (newPaid >= inv.totalAmount) {
+                newStatus = 'PAID';
+            }
+            else if (newPaid > 0) {
+                newStatus = 'PARTIAL';
+            }
+            const updated = await prisma_1.default.invoice.update({
+                where: { id },
+                data: { amountPaid: newPaid, status: newStatus },
+                include: { client: true, items: true },
+            });
+            return res.json(updated);
+        }
+        if (op === 'record_overpayment') {
+            let newPaid;
+            if (req.body.totalReceived != null && req.body.totalReceived !== '') {
+                const tr = Number(req.body.totalReceived);
+                if (!(tr > inv.totalAmount)) {
+                    return res.status(400).json({ message: 'totalReceived must be greater than invoice total.' });
+                }
+                newPaid = roundMoney(tr);
+            }
+            else {
+                const excess = Number(req.body.excessAmount);
+                if (!(excess > 0)) {
+                    return res.status(400).json({ message: 'Provide totalReceived or a positive excessAmount.' });
+                }
+                newPaid = roundMoney(inv.totalAmount + excess);
+            }
+            const updated = await prisma_1.default.invoice.update({
+                where: { id },
+                data: { amountPaid: newPaid, status: 'OVERPAID' },
+                include: { client: true, items: true },
+            });
+            return res.json(updated);
+        }
+        return res.status(400).json({ message: `Unknown op: ${op}. Use update_draft, mark_fully_paid, add_payment, or record_overpayment.` });
+    }
+    catch (error) {
+        console.error('patchInvoice error:', error);
+        res.status(500).json({ message: 'Error updating invoice' });
+    }
+};
+exports.patchInvoice = patchInvoice;
+// ==========================================
+// --- SOFT DELETION LOGIC ---
+// ==========================================
+const deleteInvoice = async (req, res) => {
+    try {
+        const id = Number(req.params.id);
+        if (!Number.isFinite(id)) {
+            return res.status(400).json({ message: 'Invalid invoice id' });
+        }
+        // SOFT DELETE: Instead of deleting from DB, we just update the timestamp
+        await prisma_1.default.invoice.update({
+            where: { id },
+            data: { deletedAt: new Date() }
+        });
+        res.json({ ok: true });
+    }
+    catch (error) {
+        res.status(500).json({ message: 'Error deleting invoice' });
+    }
+};
+exports.deleteInvoice = deleteInvoice;
+const deleteClient = async (req, res) => {
+    try {
+        const id = Number(req.params.id);
+        if (!Number.isFinite(id)) {
+            return res.status(400).json({ message: 'Invalid client id' });
+        }
+        const existing = await prisma_1.default.client.findUnique({ where: { id } });
+        if (!existing || existing.deletedAt !== null) {
+            return res.status(404).json({ message: 'Client not found' });
+        }
+        // SOFT DELETE: Update the client AND all of their active invoices
+        await prisma_1.default.$transaction(async (tx) => {
+            // 1. Soft delete all active invoices belonging to this client
+            await tx.invoice.updateMany({
+                where: { clientId: id, deletedAt: null },
+                data: { deletedAt: new Date() }
+            });
+            // 2. Soft delete the client
+            await tx.client.update({
+                where: { id },
+                data: { deletedAt: new Date() }
+            });
+        });
+        res.json({ ok: true });
+    }
+    catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Error deleting client' });
+    }
+};
+exports.deleteClient = deleteClient;

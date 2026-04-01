@@ -24,7 +24,6 @@ app.get('/', (req, res) => {
   res.send('Interior Design API is running...');
 });
 
-# Add a temporary endpoint to check
 app.get('/api/version', (req, res) => res.json({ ts: new Date().toISOString() }))
 
 app.listen(PORT, () => {
