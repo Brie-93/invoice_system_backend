@@ -227,6 +227,11 @@ function roundMoney(n: number) {
 }
 
 export const patchInvoice = async (req: AuthRequest, res: Response) => {
+  console.log('=== PATCH INVOICE ===');
+  console.log('Content-Type:', req.headers['content-type']);
+  console.log('Body:', JSON.stringify(req.body));
+  console.log('op:', req.body?.op);
+  console.log('inv id:', req.params.id);
   try {
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) {
@@ -351,7 +356,7 @@ export const patchInvoice = async (req: AuthRequest, res: Response) => {
 
     return res.status(400).json({ message: 'Unknown op. Use mark_fully_paid, add_payment, or record_overpayment.' });
   } catch (error) {
-    console.error(error);
+    console.error('patchInvoice error:', error);
     res.status(500).json({ message: 'Error updating invoice' });
   }
 };

@@ -55,7 +55,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
 
     // Generate Token
     const token = jwt.sign(
-      { userId: user.id, email: user.email },
+      { userId: user.id, name: user.name, email: user.email },
       process.env.JWT_SECRET as string,
       { expiresIn: '1d' }
     );
@@ -70,14 +70,11 @@ export const login = async (req: Request, res: Response): Promise<void> => {
 export const changePassword = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { oldPassword, newPassword } = req.body;
-    const userId = req.user?.userId; // Getting ID from the token middleware
-
-    if (!userId) {
+    const userId = Number(req.user?.userId);
+    if (!userId || Number.isNaN(userId)) {
       res.status(401).json({ message: 'Unauthorized' });
       return;
     }
-
-    // 1. Find the user in the database
     const user = await prisma.user.findUnique({ where: { id: userId } });
     if (!user) {
       res.status(404).json({ message: 'User not found' });
@@ -103,6 +100,9 @@ export const changePassword = async (req: AuthRequest, res: Response): Promise<v
     res.json({ message: 'Password updated successfully' });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ message: 'Server error while updating password' });
+    res.status(500).json({ 
+      message: 'Server error while updating password',
+      detail: error instanceof Error ? error.message : String(error) // DEV ONLY
+    });
   }
 };
