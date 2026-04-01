@@ -154,7 +154,7 @@ export const createInvoice = async (req: AuthRequest, res: Response) => {
       issueDate?: string;
       dueDate?: string;
       status?: string;
-      items?: CreateItemBody
+      items?: CreateItemBody[];
 };
 
     if (
@@ -238,7 +238,55 @@ export const patchInvoice = async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ message: 'Invoice not found' });
     }
 
-    const { op } = req.body as { op?: string; amount?: number; excessAmount?: number };
+    const { op } = req.body as { op?: string; amount?: number; excessAmount?: number; [key: string]: any };
+
+
+    if (op === 'update_draft') {
+      if (inv.status !== 'DRAFT') {
+        return res.status(400).json({ message: 'Only drafts can be completely edited.' });
+      }
+
+      const { clientId, issueDate, dueDate, status, items } = req.body;
+      
+      if (!clientId || !dueDate || !Array.isArray(items) || items.length === 0) {
+        return res.status(400).json({ message: 'Missing required fields for update.' });
+      }
+
+      const normalized = items.map((it: any) => ({
+        description: String(it.description ?? '').trim() || 'Line item',
+        quantity: Math.max(1, Math.floor(Number(it.quantity) || 1)),
+        rate: Math.max(0, Number(it.rate) || 0),
+      }));
+
+      const subtotal = normalized.reduce((sum: number, it: any) => sum + it.quantity * it.rate, 0);
+      const totalAmount = Math.round(subtotal * 1.1 * 100) / 100;
+      const invStatus = status === 'DRAFT' ? 'DRAFT' : 'PENDING';
+
+      // Update the invoice, delete old items, create new items
+      const updated = await prisma.invoice.update({
+        where: { id },
+        data: {
+          clientId: Number(clientId),
+          issueDate: issueDate ? new Date(issueDate) : new Date(),
+          dueDate: new Date(dueDate),
+          status: invStatus,
+          totalAmount,
+          items: {
+            deleteMany: {}, // Deletes the old line items
+            create: normalized, // Adds the newly edited line items
+          }
+        },
+        include: { client: true, items: true }
+      });
+
+      return res.json(updated);
+    }
+
+    if (inv.status === 'DRAFT' && op !== 'publish') {
+      return res.status(400).json({ 
+        message: 'Cannot add payments to a Draft. Please finalize/send the invoice first.' 
+      });
+    }
 
     if (op === 'mark_fully_paid') {
       const updated = await prisma.invoice.update({
