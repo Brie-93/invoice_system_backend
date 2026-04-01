@@ -86,6 +86,7 @@ export const getRecordsHistory = async (req: AuthRequest, res: Response) => {
         // NO where clause -> Fetches deleted and active!
         include: {
           invoices: {
+            where: { status: { not: 'DRAFT' } },
             orderBy: { issueDate: 'desc' },
             include: { items: true },
           },
